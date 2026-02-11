@@ -1,17 +1,14 @@
 import warnings
 from typing import Dict, List, Optional, Union
 
-from ray._common.utils import hex_to_binary, PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME
 import ray
+from ray._common.utils import PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME, hex_to_binary
 from ray._private.auto_init_hook import auto_init_ray
 from ray._private.client_mode_hook import client_mode_should_convert, client_mode_wrap
+from ray._private.label_utils import validate_label_selector
 from ray._private.utils import get_ray_doc_version
 from ray._raylet import PlacementGroupID
 from ray.util.annotations import DeveloperAPI, PublicAPI
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from ray._private.label_utils import validate_label_selector
-
-bundle_reservation_check = None
 
 VALID_PLACEMENT_GROUP_STRATEGIES = {
     "PACK",
@@ -19,23 +16,6 @@ VALID_PLACEMENT_GROUP_STRATEGIES = {
     "STRICT_PACK",
     "STRICT_SPREAD",
 }
-
-
-# We need to import this method to use for ready API.
-# But ray.remote is only available in runtime, and
-# if we define this method inside ready method, this function is
-# exported whenever ready is called, which can impact performance,
-# https://github.com/ray-project/ray/issues/6240.
-def _export_bundle_reservation_check_method_if_needed():
-    global bundle_reservation_check
-    if bundle_reservation_check:
-        return
-
-    @ray.remote(num_cpus=0)
-    def bundle_reservation_check_func(placement_group):
-        return placement_group
-
-    bundle_reservation_check = bundle_reservation_check_func
 
 
 @PublicAPI
@@ -61,8 +41,8 @@ class PlacementGroup:
     def ready(self) -> "ray._raylet.ObjectRef":
         """Returns an ObjectRef to check ready status.
 
-        This API runs a small dummy task to wait for placement group creation.
-        It is compatible to ray.get and ray.wait.
+        This API returns an ObjectRef that becomes ready when the placement group
+        is created. It is compatible with ray.get, ray.wait, and await.
 
         Example:
             .. testcode::
@@ -76,19 +56,10 @@ class PlacementGroup:
                 ray.wait([pg.ready()])
 
         """
-        self._fill_bundle_cache_if_needed()
+        if self.is_empty:
+            return ray.put(self)
 
-        _export_bundle_reservation_check_method_if_needed()
-
-        assert len(self.bundle_cache) != 0, (
-            "ready() cannot be called on placement group object with a "
-            "bundle length == 0, current bundle length: "
-            f"{len(self.bundle_cache)}"
-        )
-
-        return bundle_reservation_check.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=self),
-        ).remote(self)
+        return _call_placement_group_ready_async(self)
 
     def wait(self, timeout_seconds: Union[float, int] = 30) -> bool:
         """Wait for the placement group to be ready within the specified time.
@@ -124,6 +95,15 @@ class PlacementGroup:
 
 
 @client_mode_wrap
+def _call_placement_group_ready_async(pg: PlacementGroup) -> "ray._raylet.ObjectRef":
+    worker = ray._private.worker.global_worker
+    worker.check_connected()
+    # Serialize pg so that ray.get() returns the PlacementGroup
+    serialized = worker.get_serialization_context().serialize(pg)
+    return worker.core_worker.async_wait_placement_group_ready(pg.id, serialized)
+
+
+@client_mode_wrap
 def _call_placement_group_ready(pg_id: PlacementGroupID, timeout_seconds: int) -> bool:
     worker = ray._private.worker.global_worker
     worker.check_connected()
@@ -148,7 +128,6 @@ def placement_group(
     strategy: str = "PACK",
     name: str = "",
     lifetime: Optional[str] = None,
-    _max_cpu_fraction_per_node: float = 1.0,
     _soft_target_node_id: Optional[str] = None,
     bundle_label_selector: List[Dict[str, str]] = None,
 ) -> PlacementGroup:
@@ -170,14 +149,6 @@ def placement_group(
             will fate share with its creator and will be deleted once its
             creator is dead, or "detached", which means the placement group
             will live as a global object independent of the creator.
-        _max_cpu_fraction_per_node: (Experimental) Disallow placing bundles on nodes
-            if it would cause the fraction of CPUs used by bundles from *any* placement
-            group on the node to exceed this fraction. This effectively sets aside
-            CPUs that placement groups cannot occupy on nodes. when
-            `max_cpu_fraction_per_node < 1.0`, at least 1 CPU will be excluded from
-            placement group scheduling. Note: This feature is experimental and is not
-            recommended for use with autoscaling clusters (scale-up will not trigger
-            properly).
         _soft_target_node_id: (Private, Experimental) Soft hint where bundles of
             this placement group should be placed.
             The target node is specified by it's hex ID.
@@ -202,7 +173,6 @@ def placement_group(
         bundles=bundles,
         strategy=strategy,
         lifetime=lifetime,
-        _max_cpu_fraction_per_node=_max_cpu_fraction_per_node,
         _soft_target_node_id=_soft_target_node_id,
         bundle_label_selector=bundle_label_selector,
     )
@@ -220,7 +190,6 @@ def placement_group(
         bundles,
         strategy,
         detached,
-        _max_cpu_fraction_per_node,
         _soft_target_node_id,
         bundle_label_selector,
     )
@@ -353,7 +322,6 @@ def validate_placement_group(
     bundles: List[Dict[str, float]],
     strategy: str = "PACK",
     lifetime: Optional[str] = None,
-    _max_cpu_fraction_per_node: float = 1.0,
     _soft_target_node_id: Optional[str] = None,
     bundle_label_selector: List[Dict[str, str]] = None,
 ) -> bool:
@@ -361,22 +329,6 @@ def validate_placement_group(
 
     Raises ValueError if inputs are invalid.
     """
-
-    assert _max_cpu_fraction_per_node is not None
-
-    if _max_cpu_fraction_per_node != 1.0:
-        warnings.warn(
-            "The experimental '_max_cpu_fraction_per_node' option for placement groups "
-            "is deprecated and will be removed in a future version of Ray."
-        )
-
-    if _max_cpu_fraction_per_node <= 0 or _max_cpu_fraction_per_node > 1:
-        raise ValueError(
-            "Invalid argument `_max_cpu_fraction_per_node`: "
-            f"{_max_cpu_fraction_per_node}. "
-            "_max_cpu_fraction_per_node must be a float between 0 and 1. "
-        )
-
     if _soft_target_node_id and strategy != "STRICT_PACK":
         raise ValueError(
             "_soft_target_node_id currently only works "

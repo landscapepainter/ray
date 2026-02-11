@@ -5,7 +5,6 @@ It should be deleted once we fully move to the new executor backend.
 import logging
 from typing import Iterator, Optional, Tuple
 
-from ray.data._internal.block_list import BlockList
 from ray.data._internal.execution.interfaces import (
     Executor,
     PhysicalOperator,
@@ -16,10 +15,10 @@ from ray.data._internal.execution.streaming_executor_state import Topology
 from ray.data._internal.logical.util import record_operators_usage
 from ray.data._internal.plan import ExecutionPlan
 from ray.data._internal.stats import DatasetStats
-from ray.data._internal.util import (
-    unify_schemas_with_validation,
+from ray.data.block import (
+    BlockMetadata,
+    BlockMetadataWithSchema,
 )
-from ray.data.block import BlockMetadata, BlockMetadataWithSchema
 
 # Warn about tasks larger than this.
 TASK_SIZE_WARN_THRESHOLD_BYTES = 100000
@@ -100,13 +99,13 @@ def execute_to_legacy_bundle_iterator(
     return CacheMetadataIterator(bundle_iter)
 
 
-def execute_to_legacy_block_list(
+def execute_to_ref_bundle(
     executor: Executor,
     plan: ExecutionPlan,
     dataset_uuid: str,
     preserve_order: bool,
-) -> BlockList:
-    """Execute a plan with the new executor and translate it into a legacy block list.
+) -> RefBundle:
+    """Execute a plan with the new executor and return the output as a RefBundle.
 
     Args:
         executor: The executor to use.
@@ -115,7 +114,7 @@ def execute_to_legacy_block_list(
         preserve_order: Whether to preserve order in execution.
 
     Returns:
-        The output as a legacy block list.
+        The output as a RefBundle.
     """
     dag, stats = _get_execution_dag(
         executor,
@@ -123,10 +122,10 @@ def execute_to_legacy_block_list(
         preserve_order,
     )
     bundles = executor.execute(dag, initial_stats=stats)
-    block_list = _bundles_to_block_list(bundles)
+    ref_bundle = RefBundle.merge_ref_bundles(bundles)
     # Set the stats UUID after execution finishes.
     _set_stats_uuid_recursive(executor.get_stats(), dataset_uuid)
-    return block_list
+    return ref_bundle
 
 
 def _get_execution_dag(
@@ -166,23 +165,6 @@ def _get_initial_stats_from_plan(plan: ExecutionPlan) -> DatasetStats:
         return DatasetStats(metadata={}, parent=None)
     else:
         return plan._in_stats
-
-
-def _bundles_to_block_list(bundles: Iterator[RefBundle]) -> BlockList:
-    blocks, metadata = [], []
-    owns_blocks = True
-    schemas = []
-
-    for ref_bundle in bundles:
-        if not ref_bundle.owns_blocks:
-            owns_blocks = False
-        blocks.extend(ref_bundle.block_refs)
-        metadata.extend(ref_bundle.metadata)
-        schemas.append(ref_bundle.schema)
-    unified_schema = unify_schemas_with_validation(schemas)
-    return BlockList(
-        blocks, metadata, owned_by_consumer=owns_blocks, schema=unified_schema
-    )
 
 
 def _set_stats_uuid_recursive(stats: DatasetStats, dataset_uuid: str) -> None:

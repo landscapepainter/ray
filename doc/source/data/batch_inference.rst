@@ -55,7 +55,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
 
             # Step 2: Define a Predictor class for inference.
             # Use a class to initialize the model just once in `__init__`
-            # and re-use it for inference across multiple batches.
+            # and reuse it for inference across multiple batches.
             class HuggingFacePredictor:
                 def __init__(self):
                     from transformers import pipeline
@@ -76,7 +76,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
             # Step 2: Map the Predictor over the Dataset to get predictions.
             # Use 2 parallel actors for inference. Each actor predicts on a
             # different partition of data.
-            predictions = ds.map_batches(HuggingFacePredictor, concurrency=2)
+            predictions = ds.map_batches(HuggingFacePredictor, compute=ray.data.ActorPoolStrategy(size=2))
             # Step 3: Show one prediction output.
             predictions.show(limit=1)
 
@@ -105,7 +105,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
 
             # Step 2: Define a Predictor class for inference.
             # Use a class to initialize the model just once in `__init__`
-            # and re-use it for inference across multiple batches.
+            # and reuse it for inference across multiple batches.
             class TorchPredictor:
                 def __init__(self):
                     # Load a dummy neural network.
@@ -126,7 +126,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
             # Step 2: Map the Predictor over the Dataset to get predictions.
             # Use 2 parallel actors for inference. Each actor predicts on a
             # different partition of data.
-            predictions = ds.map_batches(TorchPredictor, concurrency=2)
+            predictions = ds.map_batches(TorchPredictor, compute=ray.data.ActorPoolStrategy(size=2))
             # Step 3: Show one prediction output.
             predictions.show(limit=1)
 
@@ -152,7 +152,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
 
             # Step 2: Define a Predictor class for inference.
             # Use a class to initialize the model just once in `__init__`
-            # and re-use it for inference across multiple batches.
+            # and reuse it for inference across multiple batches.
             class TFPredictor:
                 def __init__(self):
                     from tensorflow import keras
@@ -171,7 +171,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
             # Step 2: Map the Predictor over the Dataset to get predictions.
             # Use 2 parallel actors for inference. Each actor predicts on a
             # different partition of data.
-            predictions = ds.map_batches(TFPredictor, concurrency=2)
+            predictions = ds.map_batches(TFPredictor, compute=ray.data.ActorPoolStrategy(size=2))
              # Step 3: Show one prediction output.
             predictions.show(limit=1)
 
@@ -189,7 +189,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
             :skipif: True
 
             import ray
-            from ray.data.llm import vLLMEngineProcessorConfig, build_llm_processor
+            from ray.data.llm import vLLMEngineProcessorConfig, build_processor
             import numpy as np
 
             config = vLLMEngineProcessorConfig(
@@ -202,7 +202,7 @@ For how to configure batch inference, see :ref:`the configuration guide<batch_in
                 concurrency=1,
                 batch_size=64,
             )
-            processor = build_llm_processor(
+            processor = build_processor(
                 config,
                 preprocess=lambda row: dict(
                     messages=[
@@ -235,6 +235,25 @@ Configuration and troubleshooting
 ---------------------------------
 
 .. _batch_inference_gpu:
+
+Job-level Checkpointing
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Use job-level checkpointing to make offline batch inference jobs resilient to failures
+like node restarts or transient execution errors.
+
+When enabled, Ray Data records progress during execution. If a batch inference
+job fails partway through processing, rerunning the same pipeline with the same
+checkpoint configuration resumes by skipping already-processed records instead
+of reprocessing the entire dataset.
+
+This is especially useful for large batch inference workloads where restarting
+from the beginning would be expensive.
+
+To enable job-level checkpointing, configure a
+:class:`~ray.data.checkpoint.CheckpointConfig` on the current
+:class:`~ray.data.DataContext`. See the
+:ref:`Execution Configurations <execution_configurations>` guide for details.
 
 Using GPUs for inference
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -280,7 +299,7 @@ The remaining is the same as the :ref:`Quickstart <batch_inference_quickstart>`.
                 # Increase this for larger datasets.
                 batch_size=1,
                 # Set the concurrency to the number of GPUs in your cluster.
-                concurrency=2,
+                compute=ray.data.ActorPoolStrategy(size=2),
                 )
             predictions.show(limit=1)
 
@@ -328,7 +347,7 @@ The remaining is the same as the :ref:`Quickstart <batch_inference_quickstart>`.
                 # Increase this for larger datasets.
                 batch_size=1,
                 # Set the concurrency to the number of GPUs in your cluster.
-                concurrency=2,
+                compute=ray.data.ActorPoolStrategy(size=2),
                 )
             predictions.show(limit=1)
 
@@ -375,7 +394,7 @@ The remaining is the same as the :ref:`Quickstart <batch_inference_quickstart>`.
                 # Increase this for larger datasets.
                 batch_size=1,
                 # Set the concurrency to the number of GPUs in your cluster.
-                concurrency=2,
+                compute=ray.data.ActorPoolStrategy(size=2),
             )
             predictions.show(limit=1)
 
@@ -465,6 +484,6 @@ Suppose your cluster has 4 nodes, each with 16 CPUs. To limit to at most
         # Require 5 CPUs per actor (so at most 3 can fit per 16 CPU node).
         num_cpus=5,
         # 3 actors per node, with 4 nodes in the cluster means concurrency of 12.
-        concurrency=12,
+        compute=ray.data.ActorPoolStrategy(size=12),
         )
     predictions.show(limit=1)

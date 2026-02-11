@@ -8,6 +8,11 @@ ENV TERM=xterm
 
 ARG SSH_PORT=5020
 
+ARG PYTHON_VERSION=3.10
+ARG PYTHON_DEPSET="python/deplocks/base_extra/ray_base_extra_py${PYTHON_VERSION}.lock"
+
+COPY "$PYTHON_DEPSET" /home/ray/python_depset.lock
+
 RUN <<EOF
 #!/bin/bash
 
@@ -41,8 +46,23 @@ wget -O - https://packages.cloud.google.com/apt/doc/apt-key.gpg \
     | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
 
 # Add gdb since ray dashboard uses `memray attach`, which requires gdb.
+
+APT_PKGS=(
+    google-cloud-sdk
+    supervisor
+    vim
+    zsh
+    nfs-common
+    zip
+    unzip
+    build-essential
+    ssh
+    curl
+    gdb
+)
+
 sudo apt-get update -y
-sudo apt-get install -y google-cloud-sdk supervisor vim zsh nfs-common zip unzip build-essential ssh curl gdb
+sudo apt-get install -y "${APT_PKGS[@]}"
 sudo apt-get autoclean
 
 # Install azcopy
@@ -73,29 +93,8 @@ if [[ "$ARCH" == "x86_64" ]]; then
     rm -rf "${DYNOLOG_TMP}"
 fi
 
-# Python dependencies to install. To specify a version, please make the change
-# in OSS ray repository, but not here.
-PYTHON_REQUIREMENTS=(
-    azure-identity
-    jupyterlab
-    ipywidgets
-    grpcio
-    grpcio-tools
-
-    # Pinning jupyter_server_terminals==0.4.4 , the higher version will break the
-    # webterminal when using an older version of terminado.
-    jupyter_server_terminals==0.4.4
-
-    # [backend] is for installing anyscale CLI for use in the anyscale cloud.
-    "anyscale[backend]"
-)
-
-
-PYTHON_VERSION="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-
-uv pip install --system --no-cache-dir --index-strategy unsafe-best-match \
-    -c /home/ray/requirements_compiled.txt \
-    "${PYTHON_REQUIREMENTS[@]}"
+uv pip install --system --no-cache-dir --no-deps --index-strategy unsafe-best-match \
+    -r $HOME/python_depset.lock
 
 # Install awscli v2
 AWSCLI_TMP="$(mktemp -d)"
@@ -183,6 +182,7 @@ fi
 # Remove apt sources so that it won't run into apt update issues when running
 # the image.
 sudo rm -rf /etc/apt/sources.list.d/*
+sudo rm -rf /var/lib/apt/lists/*
 
 EOF
 

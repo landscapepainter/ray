@@ -1,183 +1,72 @@
-import asyncio
 import copy
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Union
+import logging
+from typing import TYPE_CHECKING, Dict, List
 
+import ray
 import ray.train
-from ray.data import DataIterator, Dataset, NodeIdStr
-from ray.data.context import DataContext
-from ray.train.v2._internal.execution.callback import WorkerGroupCallback
+from ray.actor import ActorHandle
+from ray.exceptions import GetTimeoutError
+from ray.train.v2._internal.data_integration.interfaces import (
+    DatasetShardMetadata,
+    DatasetShardProvider,
+)
+from ray.train.v2._internal.execution.callback import (
+    ControllerCallback,
+    WorkerGroupCallback,
+)
+from ray.train.v2._internal.execution.context import TrainRunContext
 from ray.train.v2._internal.execution.worker_group.worker_group import (
     Worker,
     WorkerGroup,
+    WorkerGroupContext,
 )
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from ray.types import ObjectRef
 
-# A type representing either a ray.data.Dataset or a function that returns a
-# ray.data.Dataset and accepts no arguments.
-GenDataset = Union[Dataset, Callable[[], Dataset]]
+if TYPE_CHECKING:
+    from ray.data import DataIterator
+    from ray.data.context import DataContext
 
-
-@dataclass
-class DatasetShardMetadata:
-    """Metadata about a dataset shard used for lookup and configuration."""
-
-    dataset_name: str
-    world_rank: int
+logger = logging.getLogger(__name__)
 
 
-class DatasetManager:
-    """Manages the dataset shards for datasets configured in the trainer."""
+class RayDatasetShardProvider:
+    """A shard provider that Train workers use to access a DataIterator for a dataset."""
 
-    def __init__(
-        self,
-        datasets: Dict[str, GenDataset],
-        data_config: ray.train.DataConfig,
-        data_context: DataContext,
-        world_size: int,
-        worker_node_ids: List[NodeIdStr],
-    ):
-        self._datasets = {k: v() if callable(v) else v for k, v in datasets.items()}
-        self._data_config = data_config
-        self._datasets_to_split = (
-            set(self._datasets.keys())
-            if data_config._datasets_to_split == "all"
-            else set(data_config._datasets_to_split)
-        )
-        self._world_size = world_size
-        self._worker_node_ids = worker_node_ids
+    def __init__(self, ds_iterators: Dict[str, "DataIterator"]):
+        # Maps dataset_name to a DataIterator.
+        self._dataset_iterators = ds_iterators
 
-        # Maps dataset name to a list of cached `DataIterator`s corresponding to
-        # Train worker ranks.
-        self._dataset_iterators: Dict[str, List[DataIterator]] = {}
-
-        # A condition variable to synchronize the calls to the async `get_dataset_shard` method.
-        self._condition = asyncio.Condition()
-
-        DataContext._set_current(data_context)
-
-    def _create_dataset_iterators(
-        self, dataset_info: DatasetShardMetadata, base_dataset: Dataset
-    ) -> List[DataIterator]:
-        dataset_name = dataset_info.dataset_name
-
-        iterators_per_rank = self._data_config.configure(
-            datasets={dataset_name: base_dataset},
-            world_size=self._world_size,
-            worker_handles=None,
-            worker_node_ids=self._worker_node_ids,
-        )
-        assert len(iterators_per_rank) == self._world_size
-        # TODO: Update DataConfig to return a List[DataIterator] directly
-        # for configuring a single dataset.
-        # Convert the List[Dict[str, DataIterator]] to a List[DataIterator],
-        # since we only configured one dataset.
-        return [iterators_per_rank[i][dataset_name] for i in range(self._world_size)]
-
-    def _get_unsharded_dataset_iterator(
-        self, dataset_info: DatasetShardMetadata
-    ) -> DataIterator:
-        """Returns the dataset iterator for a dataset that is excluded
-        from `DataConfig.datasets_to_split`.
-
-        Note that this method is NOT a barrier across workers and can be called
-        by any subset of workers and will return immediately.
-        """
-        dataset_name = dataset_info.dataset_name
-        world_rank = dataset_info.world_rank
-
-        if dataset_name not in self._dataset_iterators:
-            self._dataset_iterators[dataset_name] = self._create_dataset_iterators(
-                dataset_info, self._datasets[dataset_name]
+    def get_dataset_shard(self, dataset_info: DatasetShardMetadata) -> "DataIterator":
+        if dataset_info.dataset_name not in self._dataset_iterators:
+            raise KeyError(
+                f"Dataset shard for '{dataset_info.dataset_name}' not found. "
+                "Please ensure that the dataset is passed through the Trainer `datasets` "
+                "argument."
             )
 
-        return self._dataset_iterators[dataset_name][world_rank]
-
-    async def _get_sharded_dataset_iterator(
-        self, dataset_info: DatasetShardMetadata
-    ) -> DataIterator:
-        """Returns the dataset iterator for a dataset that is included
-        in `DataConfig.datasets_to_split`.
-
-        Note that this method is a barrier across workers,
-        and all workers must call this method before training.
-        """
-        dataset_name = dataset_info.dataset_name
-        world_rank = dataset_info.world_rank
-
-        async with self._condition:
-            if dataset_name in self._dataset_iterators:
-                # If the dataset iterators have already been created, return the
-                # existing one.
-                iterator = self._dataset_iterators[dataset_name][world_rank]
-            elif world_rank == 0:
-                # In this case, the dataset iterators have not been created yet.
-                # The dataset only needs to be configured once globally for all workers.
-                # Do it only when the rank 0 worker calls this method.
-                iterators = self._create_dataset_iterators(
-                    dataset_info, self._datasets[dataset_name]
-                )
-                iterator = iterators[world_rank]
-
-                # Cache the dataset iterators for future use.
-                self._dataset_iterators[dataset_name] = iterators
-                self._condition.notify_all()
-            else:
-                # Wait for the dataset iterators to be created by the rank 0 worker.
-                await self._condition.wait_for(
-                    lambda: dataset_name in self._dataset_iterators
-                )
-                iterator = self._dataset_iterators[dataset_name][world_rank]
-        return iterator
-
-    async def get_dataset_shard(
-        self,
-        dataset_info: DatasetShardMetadata,
-    ) -> DataIterator:
-        """Create and return the dataset shard iterator for a Ray Train worker's
-        call to `ray.train.get_dataset_shard`.
-
-        This method is a barrier that should be called by all Ray Train workers at once.
-        If the dataset iterators have already been created, return the existing ones.
-        Otherwise, create the dataset iterators and cache them.
-
-        Here's an example of how this method is used with 4 workers:
-
-        Rank 2 calls get_dataset_shard, waits on the condition variable.
-        Rank 1 calls get_dataset_shard, waits on the condition variable.
-        Rank 0 calls get_dataset_shard, creates the dataset iterators, caches them,
-        and notifies all workers hanging on the condition variable.
-        Rank 3 calls get_dataset_shard, returns the cached iterator.
-        """
-        dataset_name = dataset_info.dataset_name
-
-        if dataset_name in self._datasets_to_split:
-            return await self._get_sharded_dataset_iterator(dataset_info)
-        else:
-            return self._get_unsharded_dataset_iterator(dataset_info)
+        return self._dataset_iterators[dataset_info.dataset_name]
 
 
-class DatasetsSetupCallback(WorkerGroupCallback):
-    """The callback to setup Ray Datasets for the worker group."""
+class DatasetsCallback(WorkerGroupCallback, ControllerCallback):
+    """A callback for managing Ray Datasets for the worker group."""
 
-    def __init__(
-        self,
-        datasets: Dict[str, GenDataset],
-        data_config: ray.train.DataConfig,
-        scaling_config: ray.train.ScalingConfig,
-    ):
-        self._datasets = datasets
-        self._data_config = data_config
-        self._scaling_config = scaling_config
+    def __init__(self, train_run_context: TrainRunContext):
+        self._datasets = train_run_context.datasets
+        self._data_config = copy.deepcopy(train_run_context.dataset_config)
+        self._scaling_config = train_run_context.scaling_config
+        self._coordinator_actors: List[ActorHandle] = []
+        self._shutdown_refs: List[ObjectRef] = []
 
         # Capture the current DataContext to propagate it to
         # the Train workers later.
         # The propagation works in the following way:
-        # 1. This callback is created when user creates the Trainer.
+        # 1. This callback is created when user create the Trainer.
         # 2. Then this callback will be passed to the Controller actor.
         # 3. Lastly, when the worker group is initialized, the Controller
         #    will call the `after_worker_group_start` callback to propagate
         #    the DataContext to Train workers.
+        from ray.data.context import DataContext
+
         self._data_context = copy.deepcopy(DataContext.get_current())
 
     def get_train_total_resources(
@@ -187,46 +76,97 @@ class DatasetsSetupCallback(WorkerGroupCallback):
         these resources logically from its available pool."""
         return scaling_config.total_resources
 
+    def _get_coordinator_actors(
+        self, ds_iterators_per_rank: List[Dict[str, "DataIterator"]]
+    ) -> List[ActorHandle]:
+        """
+        Returns a list of each unique SplitCoordinator actor handle given the iterators per rank.
+        These handles will later be used to call shutdown on the actors.
+        """
+        from ray.data._internal.iterator.stream_split_iterator import (
+            StreamSplitDataIterator,
+        )
+
+        # Note: Currently, we only need to check rank 0 for split iterators.
+        # In the future, if datasets can be split across only a subset of ranks,
+        # we may need to process all ranks.
+        rank_0_iterators = ds_iterators_per_rank[0]
+        coord_actors = [
+            iterator._coord_actor
+            for iterator in rank_0_iterators.values()
+            if isinstance(iterator, StreamSplitDataIterator)
+        ]
+        return coord_actors
+
+    def _shutdown_data_executors(self):
+        """Eagerly shutdown the data executors of the split coordinator actors."""
+        self._shutdown_refs = [
+            coord.shutdown_executor.remote() for coord in self._coordinator_actors
+        ]
+
     # --------------------------
     # WorkerGroupCallback
     # --------------------------
 
-    def before_init_train_context(self, workers: List[Worker]) -> Dict[str, List[Any]]:
-        if not self._datasets:
-            return {"dataset_manager": [None] * len(workers)}
-
+    def before_init_train_context(
+        self, workers: List[Worker]
+    ) -> Dict[str, List[DatasetShardProvider]]:
         world_size = len(workers)
         worker_node_ids = [worker.metadata.node_id for worker in workers]
 
+        # Notify the DataConfig about the total resources reserved for training.
         total_train_resources = self.get_train_total_resources(self._scaling_config)
         self._data_config.set_train_total_resources(
             total_train_resources.get("CPU", 0), total_train_resources.get("GPU", 0)
         )
 
-        dataset_manager = (
-            ray.remote(DatasetManager)
-            .options(
-                num_cpus=0,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    ray.get_runtime_context().get_node_id(), soft=False
-                ),
-            )
-            .remote(
-                datasets=self._datasets,
-                data_config=self._data_config,
-                data_context=self._data_context,
-                world_size=world_size,
-                worker_node_ids=worker_node_ids,
-            )
+        datasets = {k: v() if callable(v) else v for k, v in self._datasets.items()}
+        ds_iterators_per_rank = self._data_config.configure(
+            datasets=datasets,
+            world_size=world_size,
+            worker_handles=None,
+            worker_node_ids=worker_node_ids,
         )
-        return {"dataset_manager": [dataset_manager] * len(workers)}
+        assert len(ds_iterators_per_rank) == world_size
+
+        self._coordinator_actors = self._get_coordinator_actors(ds_iterators_per_rank)
+
+        shard_providers_per_rank = [
+            RayDatasetShardProvider(ds_iterators=ds_iterators_per_rank[rank])
+            for rank in range(world_size)
+        ]
+        return {"dataset_shard_provider": shard_providers_per_rank}
 
     def after_worker_group_start(self, worker_group: WorkerGroup):
         # Propagate DataContext
-        def _propagate_data_context(ctx: DataContext):
+        from ray.data.context import DataContext
+
+        def _propagate_data_context(ctx: "DataContext"):
             DataContext._set_current(ctx)
 
         worker_group.execute(
             _propagate_data_context,
             self._data_context,
         )
+
+    def after_worker_group_shutdown(
+        self, worker_group_context: WorkerGroupContext
+    ) -> None:
+        self._shutdown_data_executors()
+
+    def after_worker_group_abort(
+        self, worker_group_context: WorkerGroupContext
+    ) -> None:
+        self._shutdown_data_executors()
+
+    # --------------------------
+    # ControllerCallback
+    # --------------------------
+
+    def before_controller_shutdown(self):
+        try:
+            ray.get(self._shutdown_refs, timeout=5)
+        except GetTimeoutError:
+            logger.error("Ray Data executor shutdown task timed out after 5 seconds.")
+        except Exception:
+            logger.exception("Failed to gracefully terminate Ray Data executors.")

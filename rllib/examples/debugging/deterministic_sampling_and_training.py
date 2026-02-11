@@ -56,18 +56,17 @@ Determinism works! ok
 import ray
 from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.examples.envs.classes.multi_agent import MultiAgentCartPole
+from ray.rllib.examples.utils import (
+    add_rllib_example_script_args,
+    run_rllib_example_script_experiment,
+)
 from ray.rllib.utils.metrics import (
     ENV_RUNNER_RESULTS,
     EPISODE_RETURN_MEAN,
     LEARNER_RESULTS,
 )
-from ray.rllib.utils.test_utils import (
-    add_rllib_example_script_args,
-    check,
-    run_rllib_example_script_experiment,
-)
+from ray.rllib.utils.test_utils import check
 from ray.tune.registry import get_trainable_cls, register_env
-
 
 parser = add_rllib_example_script_args(default_iters=3)
 parser.set_defaults(
@@ -93,6 +92,8 @@ if __name__ == "__main__":
         .environment("env" if args.num_agents > 0 else "CartPole-v1")
         # Make sure every environment gets a fixed seed.
         .debugging(seed=args.seed)
+        # Log gradients and check them in the test.
+        .reporting(log_gradients=True)
     )
 
     # Add a simple multi-agent setup.

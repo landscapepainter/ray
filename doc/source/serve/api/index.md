@@ -70,6 +70,7 @@ See the [model composition guide](serve-model-composition) for how to update cod
    serve.delete
    serve.status
    serve.shutdown
+   serve.shutdown_async
 ```
 
 ### Configurations
@@ -84,6 +85,10 @@ See the [model composition guide](serve-model-composition) for how to update cod
    serve.config.HTTPOptions
    serve.config.AutoscalingConfig
    serve.config.AutoscalingPolicy
+   serve.config.AutoscalingContext
+   serve.autoscaling_policy.replica_queue_length_autoscaling_policy
+   serve.autoscaling_policy.async_inference_autoscaling_policy
+   serve.config.AggregationFunction
    serve.config.RequestRouterConfig
 ```
 
@@ -101,6 +106,11 @@ See the [model composition guide](serve-model-composition) for how to update cod
    serve.schema.ServeStatus
    serve.schema.DeploymentStatusOverview
    serve.schema.EncodingType
+   serve.schema.AutoscalingMetricsHealth
+   serve.schema.AutoscalingStatus
+   serve.schema.ScalingDecision
+   serve.schema.DeploymentAutoscalingDetail
+   serve.schema.ReplicaRank
 ```
 
 ### Request Router
@@ -132,9 +142,11 @@ See the [model composition guide](serve-model-composition) for how to update cod
    serve.get_app_handle
    serve.get_deployment_handle
    serve.grpc_util.RayServegRPCContext
+   serve.grpc_util.gRPCInputStream
    serve.exceptions.BackPressureError
    serve.exceptions.RayServeException
    serve.exceptions.RequestCancelledError
+   serve.exceptions.gRPCStatusError
    serve.exceptions.DeploymentUnavailableError
 ```
 
@@ -387,6 +399,8 @@ Content-Type: application/json
    schema.CeleryAdapterConfig
    schema.TaskProcessorConfig
    schema.TaskResult
+   schema.ScaleDeploymentRequest
+   schema.TaskProcessorAdapter
 ```
 
 (serve-rest-api-response-schema)=
@@ -406,6 +420,9 @@ Content-Type: application/json
    schema.ProxyStatus
    schema.TargetGroup
    schema.Target
+   schema.DeploymentNode
+   schema.DeploymentTopology
+
 ```
 
 ## Observability

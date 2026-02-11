@@ -21,7 +21,6 @@
 #include "ray/util/cmd_line_utils.h"
 #include "ray/util/network_util.h"
 #include "ray/util/process.h"
-#include "ray/util/util.h"
 #include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
@@ -84,7 +83,7 @@ void ProcessHelper::RayStart(CoreWorkerOptions::TaskExecutionCallback callback) 
 
   if (ConfigInternal::Instance().worker_type == WorkerType::DRIVER &&
       bootstrap_ip.empty()) {
-    bootstrap_ip = GetNodeIpAddress();
+    bootstrap_ip = ray::GetNodeIpAddressFromPerspective();
     StartRayNode(bootstrap_ip,
                  bootstrap_port,
                  ConfigInternal::Instance().redis_username,
@@ -96,9 +95,9 @@ void ProcessHelper::RayStart(CoreWorkerOptions::TaskExecutionCallback callback) 
   std::string node_ip = ConfigInternal::Instance().node_ip_address;
   if (node_ip.empty()) {
     if (!bootstrap_ip.empty()) {
-      node_ip = GetNodeIpAddress(bootstrap_address);
+      node_ip = ray::GetNodeIpAddressFromPerspective(bootstrap_address);
     } else {
-      node_ip = GetNodeIpAddress();
+      node_ip = ray::GetNodeIpAddressFromPerspective();
     }
   }
 
@@ -153,7 +152,9 @@ void ProcessHelper::RayStart(CoreWorkerOptions::TaskExecutionCallback callback) 
   options.driver_name = "cpp_worker";
   options.metrics_agent_port = -1;
   options.task_execution_callback = callback;
-  options.startup_token = ConfigInternal::Instance().startup_token;
+  if (ConfigInternal::Instance().worker_type != WorkerType::DRIVER) {
+    options.worker_id = WorkerID::FromHex(ConfigInternal::Instance().worker_id);
+  }
   options.runtime_env_hash = ConfigInternal::Instance().runtime_env_hash;
   rpc::JobConfig job_config;
   job_config.set_default_actor_lifetime(

@@ -41,9 +41,9 @@ void InlineDependencies(
         if (!it->second->IsInPlasmaError()) {
           // The object has not been promoted to plasma. Inline the object by
           // replacing it with the raw value.
-          rpc::TensorTransport transport =
-              tensor_transport_getter(id).value_or(rpc::TensorTransport::OBJECT_STORE);
-          if (transport == rpc::TensorTransport::OBJECT_STORE) {
+          if (auto tensor_transport = tensor_transport_getter(id)) {
+            mutable_arg->set_tensor_transport(std::move(*tensor_transport));
+          } else {
             // Clear the object reference if the object is transferred via the object
             // store. If we don't clear the object reference, tasks with a large number of
             // arguments will experience performance degradation due to higher
@@ -60,8 +60,6 @@ void InlineDependencies(
             // decrement the reference count upon inlining, we may cause the tensors on
             // the sender actor to be freed before transferring to the receiver actor.
             inlined_dependency_ids->push_back(id);
-          } else {
-            mutable_arg->set_tensor_transport(transport);
           }
 
           mutable_arg->set_is_inlined(true);
@@ -77,6 +75,9 @@ void InlineDependencies(
             mutable_arg->add_nested_inlined_refs()->CopyFrom(nested_ref);
             contained_ids->push_back(ObjectID::FromBinary(nested_ref.object_id()));
           }
+        } else {
+          auto tensor_transport = mutable_arg->object_ref().tensor_transport();
+          mutable_arg->set_tensor_transport(tensor_transport);
         }
         found++;
       }
@@ -101,12 +102,12 @@ void LocalDependencyResolver::ResolveDependencies(
     if (task.ArgByRef(i)) {
       local_dependency_ids.insert(task.ArgObjectId(i));
     }
-    for (const auto &in : task.ArgInlinedRefs(i)) {
-      auto object_id = ObjectID::FromBinary(in.object_id());
+    for (const auto &inlined_ref : task.ArgInlinedRefs(i)) {
+      const auto object_id = ObjectID::FromBinary(inlined_ref.object_id());
       if (ObjectID::IsActorID(object_id)) {
-        auto actor_id = ObjectID::ToActorID(object_id);
+        const auto actor_id = ObjectID::ToActorID(object_id);
         if (actor_creator_.IsActorInRegistering(actor_id)) {
-          actor_dependency_ids.insert(ObjectID::ToActorID(object_id));
+          actor_dependency_ids.insert(actor_id);
         }
       }
     }
@@ -165,7 +166,7 @@ void LocalDependencyResolver::ResolveDependencies(
                                                     contained_ids);
           }
           if (resolved_task_state) {
-            resolved_task_state->on_dependencies_resolved(resolved_task_state->status);
+            resolved_task_state->on_dependencies_resolved_(resolved_task_state->status);
           }
         });
   }
@@ -195,7 +196,7 @@ void LocalDependencyResolver::ResolveDependencies(
           }
 
           if (resolved_task_state) {
-            resolved_task_state->on_dependencies_resolved(resolved_task_state->status);
+            resolved_task_state->on_dependencies_resolved_(resolved_task_state->status);
           }
         });
   }

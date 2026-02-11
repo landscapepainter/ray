@@ -20,11 +20,14 @@
 
 #include "ray/common/grpc_util.h"
 #include "ray/common/ray_config.h"
+#include "ray/raylet/metrics.h"
 
 namespace ray {
 
 ClusterResourceManager::ClusterResourceManager(instrumented_io_context &io_service)
-    : timer_(PeriodicalRunner::Create(io_service)) {
+    : timer_(PeriodicalRunner::Create(io_service)),
+      local_resource_view_node_count_gauge_(
+          raylet::GetLocalResourceViewNodeCountGaugeMetric()) {
   timer_->RunFnPeriodically(
       [this]() {
         auto syncer_delay = absl::Milliseconds(
@@ -77,16 +80,19 @@ bool ClusterResourceManager::UpdateNode(
     return false;
   }
 
-  auto resources_total = MapFromProtobuf(resource_view_sync_message.resources_total());
-  auto resources_available =
+  const auto resources_total =
+      MapFromProtobuf(resource_view_sync_message.resources_total());
+  const auto resources_available =
       MapFromProtobuf(resource_view_sync_message.resources_available());
+  auto node_labels = MapFromProtobuf(resource_view_sync_message.labels());
   NodeResources node_resources =
       ResourceMapToNodeResources(resources_total, resources_available);
   NodeResources local_view;
   RAY_CHECK(GetNodeResources(node_id, &local_view));
 
-  local_view.total = node_resources.total;
-  local_view.available = node_resources.available;
+  local_view.total = std::move(node_resources.total);
+  local_view.available = std::move(node_resources.available);
+  local_view.labels = std::move(node_labels);
   local_view.object_pulls_queued = resource_view_sync_message.object_pulls_queued();
 
   // Update the idle duration for the node in terms of resources usage.
@@ -95,9 +101,11 @@ bool ClusterResourceManager::UpdateNode(
   // Last update time to the local node resources view.
   local_view.last_resource_update_time = absl::Now();
 
-  local_view.is_draining = resource_view_sync_message.is_draining();
-  local_view.draining_deadline_timestamp_ms =
-      resource_view_sync_message.draining_deadline_timestamp_ms();
+  if (!local_view.is_draining) {
+    local_view.is_draining = resource_view_sync_message.is_draining();
+    local_view.draining_deadline_timestamp_ms =
+        resource_view_sync_message.draining_deadline_timestamp_ms();
+  }
 
   AddOrUpdateNode(node_id, local_view);
   received_node_resources_[node_id] = std::move(local_view);
@@ -107,6 +115,26 @@ bool ClusterResourceManager::UpdateNode(
 bool ClusterResourceManager::RemoveNode(scheduling::NodeID node_id) {
   received_node_resources_.erase(node_id);
   return nodes_.erase(node_id) != 0;
+}
+
+bool ClusterResourceManager::SetNodeDraining(const scheduling::NodeID &node_id,
+                                             bool is_draining,
+                                             int64_t draining_deadline_timestamp_ms) {
+  auto it = nodes_.find(node_id);
+  if (it == nodes_.end()) {
+    return false;
+  }
+
+  auto *local_view = it->second.GetMutableLocalView();
+  local_view->is_draining = is_draining;
+  local_view->draining_deadline_timestamp_ms = draining_deadline_timestamp_ms;
+  auto rnr_it = received_node_resources_.find(node_id);
+  if (rnr_it != received_node_resources_.end()) {
+    rnr_it->second.is_draining = is_draining;
+    rnr_it->second.draining_deadline_timestamp_ms = draining_deadline_timestamp_ms;
+  }
+
+  return true;
 }
 
 bool ClusterResourceManager::GetNodeResources(scheduling::NodeID node_id,
@@ -290,13 +318,17 @@ BundleLocationIndex &ClusterResourceManager::GetBundleLocationIndex() {
 
 void ClusterResourceManager::SetNodeLabels(
     const scheduling::NodeID &node_id,
-    const absl::flat_hash_map<std::string, std::string> &labels) {
+    absl::flat_hash_map<std::string, std::string> labels) {
   auto it = nodes_.find(node_id);
   if (it == nodes_.end()) {
     NodeResources node_resources;
     it = nodes_.emplace(node_id, node_resources).first;
   }
-  it->second.GetMutableLocalView()->labels = labels;
+  it->second.GetMutableLocalView()->labels = std::move(labels);
+}
+
+void ClusterResourceManager::RecordMetrics() const {
+  local_resource_view_node_count_gauge_.Record(static_cast<double>(nodes_.size()));
 }
 
 }  // namespace ray

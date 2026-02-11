@@ -22,6 +22,7 @@
 #include "absl/flags/parse.h"
 #include "absl/strings/str_split.h"
 #include "nlohmann/json.hpp"
+#include "ray/common/id.h"
 #include "ray/util/network_util.h"
 
 ABSL_FLAG(std::string, ray_address, "", "The address of the Ray cluster to connect to.");
@@ -76,10 +77,10 @@ ABSL_FLAG(std::string,
           "command. It takes effect only if Ray head is started by a driver. Run `ray "
           "start --help` for details.");
 
-ABSL_FLAG(int64_t,
-          startup_token,
-          -1,
-          "The startup token assigned to this worker process by the raylet.");
+ABSL_FLAG(std::string,
+          ray_worker_id,
+          "",
+          "The worker ID assigned to this worker process by the raylet (hex string).");
 
 ABSL_FLAG(std::string,
           ray_default_actor_lifetime,
@@ -192,7 +193,7 @@ void ConfigInternal::Init(RayConfig &config, int argc, char **argv) {
           absl::StrSplit(FLAGS_ray_head_args.CurrentValue(), ' ', absl::SkipEmpty());
       head_args.insert(head_args.end(), args.begin(), args.end());
     }
-    startup_token = absl::GetFlag<int64_t>(FLAGS_startup_token);
+    worker_id = absl::GetFlag<std::string>(FLAGS_ray_worker_id);
     if (!FLAGS_ray_default_actor_lifetime.CurrentValue().empty()) {
       default_actor_lifetime =
           ParseDefaultActorLifetimeType(FLAGS_ray_default_actor_lifetime.CurrentValue());
@@ -235,7 +236,7 @@ void ConfigInternal::Init(RayConfig &config, int argc, char **argv) {
       ray_namespace = FLAGS_ray_job_namespace.CurrentValue();
     }
     if (ray_namespace.empty()) {
-      ray_namespace = GenerateUUIDV4();
+      ray_namespace = UniqueID::FromRandom().Hex();
     }
   }
 

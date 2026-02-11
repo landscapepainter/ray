@@ -12,6 +12,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -21,7 +22,6 @@ import numpy as np
 import pyarrow as pa
 
 import ray
-from ray.air.util.tensor_extensions.arrow import ArrowConversionError
 from ray.data._internal.util import _check_pyarrow_version, _truncated_repr
 from ray.types import ObjectRef
 from ray.util import log_once
@@ -57,6 +57,11 @@ Schema = Union[type, "PandasBlockSchema", "pyarrow.lib.Schema"]
 # Represents a single column of the ``Block``
 BlockColumn = Union["pyarrow.ChunkedArray", "pyarrow.Array", "pandas.Series"]
 
+# Represents a single column of the ``Batch``
+BatchColumn = Union[
+    "pandas.Series", "np.ndarray", "pyarrow.Array", "pyarrow.ChunkedArray"
+]
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,14 @@ logger = logging.getLogger(__name__)
 class BlockType(Enum):
     ARROW = "arrow"
     PANDAS = "pandas"
+
+
+@DeveloperAPI
+class BatchFormat(str, Enum):
+    # NOTE: This is to maintain compatibility w/ existing APIs
+    ARROW = "pyarrow"
+    PANDAS = "pandas"
+    NUMPY = "numpy"
 
 
 # User-facing data batch type. This is the data type for data that is supplied to and
@@ -85,11 +98,11 @@ class _CallableClassProtocol(Protocol[T, U]):
         ...
 
 
-# A user defined function passed to map, map_batches, ec.
+# A user defined function passed to flat_map, map_batches, etc.
 UserDefinedFunction = Union[
     Callable[[T], U],
     Callable[[T], Iterator[U]],
-    "_CallableClassProtocol",
+    type["_CallableClassProtocol"],
 ]
 
 # A list of block references pending computation by a single task. For example,
@@ -114,7 +127,22 @@ def _is_empty_schema(schema: Optional[Schema]) -> bool:
     )
 
 
-def _apply_batch_format(given_batch_format: Optional[str]) -> str:
+def _take_first_non_empty_schema(schemas: Iterator["Schema"]) -> Optional["Schema"]:
+    """Return the first non-empty schema from an iterator of schemas.
+
+    Args:
+        schemas: Iterator of schemas to check.
+
+    Returns:
+        The first non-empty schema, or None if all schemas are empty.
+    """
+    for schema in schemas:
+        if not _is_empty_schema(schema):
+            return schema
+    return None
+
+
+def _apply_batch_format(given_batch_format: Optional[str]) -> Optional[str]:
     if given_batch_format == "default":
         given_batch_format = DEFAULT_BATCH_FORMAT
     if given_batch_format not in VALID_BATCH_FORMATS:
@@ -147,6 +175,7 @@ class BlockExecStats:
         self.end_time_s: Optional[float] = None
         self.wall_time_s: Optional[float] = None
         self.udf_time_s: Optional[float] = 0
+        self.block_ser_time_s: Optional[float] = None
         self.cpu_time_s: Optional[float] = None
         self.node_id = ray.runtime_context.get_runtime_context().get_node_id()
         self.max_uss_bytes: int = 0
@@ -178,7 +207,7 @@ class _BlockExecStatsBuilder:
         self._start_time = time.perf_counter()
         self._start_cpu = time.process_time()
 
-    def build(self) -> "BlockExecStats":
+    def build(self, block_ser_time_s: Optional[int] = None) -> "BlockExecStats":
         # Record end times.
         end_time = time.perf_counter()
         end_cpu = time.process_time()
@@ -189,6 +218,7 @@ class _BlockExecStatsBuilder:
         stats.end_time_s = end_time
         stats.wall_time_s = end_time - self._start_time
         stats.cpu_time_s = end_cpu - self._start_cpu
+        stats.block_ser_time_s = block_ser_time_s
 
         return stats
 
@@ -315,6 +345,10 @@ class BlockAccessor:
         """
         raise NotImplementedError
 
+    def drop(self, columns: List[str]) -> Block:
+        """Return a new block with the list of provided columns dropped"""
+        raise NotImplementedError
+
     def select(self, columns: List[Optional[str]]) -> Block:
         """Return a new block containing the provided columns."""
         raise NotImplementedError
@@ -322,6 +356,19 @@ class BlockAccessor:
     def rename_columns(self, columns_rename: Dict[str, str]) -> Block:
         """Return the block reflecting the renamed columns."""
         raise NotImplementedError
+
+    def upsert_column(self, column_name: str, column_data: BlockColumn) -> Block:
+        """
+        Upserts a column into the block. If the column already exists, it will be replaced.
+
+        Args:
+            column_name: The name of the column to upsert.
+            column_data: The data to upsert into the column. (Arrow Array/ChunkedArray for Arrow blocks, Series or array-like for Pandas blocks)
+
+        Returns:
+            The updated block.
+        """
+        raise NotImplementedError()
 
     def random_shuffle(self, random_seed: Optional[int]) -> Block:
         """Randomly shuffle this block."""
@@ -426,6 +473,10 @@ class BlockAccessor:
 
         elif isinstance(batch, collections.abc.Mapping):
             if block_type is None or block_type == BlockType.ARROW:
+                from ray.data._internal.tensor_extensions.arrow import (
+                    ArrowConversionError,
+                )
+
                 try:
                     return cls.batch_to_arrow_block(batch)
                 except ArrowConversionError as e:
@@ -465,7 +516,7 @@ class BlockAccessor:
         import pandas
         import pyarrow
 
-        if isinstance(block, pyarrow.Table):
+        if isinstance(block, (pyarrow.Table, pyarrow.RecordBatch)):
             from ray.data._internal.arrow_block import ArrowBlockAccessor
 
             return ArrowBlockAccessor(block)
@@ -604,6 +655,31 @@ class BlockAccessor:
 
         return _get_group_boundaries_sorted_numpy(list(projected_block.values()))
 
+    def _iter_groups_sorted(
+        self, sort_key: "SortKey"
+    ) -> Iterator[Tuple[Sequence[KeyType], Block]]:
+        """
+        NOTE: THIS METHOD ASSUMES THE BLOCK BEING SORTED
+
+        Creates an iterator over (zero-copy) blocks of rows grouped by
+        provided key(s).
+        """
+
+        key_col_names: List[str] = sort_key.get_columns()
+
+        if not key_col_names:
+            # Global aggregation consists of a single "group", so we short-circuit.
+            yield tuple(), self.to_block()
+            return
+
+        boundaries = self._get_group_boundaries_sorted(key_col_names)
+
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            # Fetch tuple of key values from the first row
+            row = self._get_row(start)
+
+            yield row[key_col_names], self.slice(start, end, copy=False)
+
 
 @DeveloperAPI(stability="beta")
 class BlockColumnAccessor:
@@ -643,9 +719,41 @@ class BlockColumnAccessor:
         """Returns new column holding only distinct values of the current one"""
         raise NotImplementedError()
 
+    def value_counts(self) -> Dict[str, List]:
+        raise NotImplementedError()
+
+    def hash(self) -> BlockColumn:
+        """
+        Computes a 64-bit hash value for each row in the column.
+
+        Provides a unified hashing method across supported backends.
+        Handles complex types like lists or nested structures by producing a single hash per row.
+        These hashes are useful for downstream operations such as deduplication, grouping, or partitioning.
+
+        Internally, Polars is used to compute row-level hashes even when the original column
+        is backed by Pandas or PyArrow.
+
+        Returns:
+            A column of 64-bit integer hashes, returned in the same format as the
+            underlying backend (e.g., Pandas Series or PyArrow Array).
+        """
+        raise NotImplementedError()
+
     def flatten(self) -> BlockColumn:
         """Flattens nested lists merging them into top-level container"""
 
+        raise NotImplementedError()
+
+    def dropna(self) -> BlockColumn:
+        raise NotImplementedError()
+
+    def is_composed_of_lists(self) -> bool:
+        """
+        Checks whether the column is composed of list-like elements.
+
+        Returns:
+            True if the column is made up of list-like values; False otherwise.
+        """
         raise NotImplementedError()
 
     def sum_of_squared_diffs_from_mean(
